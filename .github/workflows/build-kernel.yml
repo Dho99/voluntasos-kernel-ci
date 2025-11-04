@@ -1,3 +1,4 @@
+# (place this at .github/workflows/build-kernel.yml in your repo)
 name: Build VoluntasOS Kernel
 
 on:
@@ -34,19 +35,19 @@ jobs:
           sudo docker system prune -af || true
           df -h
 
-      - name: Install deps
+      - name: Install deps (including debhelper)
         run: |
           sudo apt-get update
+          # Core build deps + debhelper/devscripts needed for dpkg-buildpackage
           sudo apt-get install -y \
             build-essential bc flex bison libssl-dev libelf-dev \
             dwarves pahole libncurses-dev fakeroot rsync ccache git dpkg-dev \
-            zstd xz-utils tar gzip python3 pkg-config binutils kmod libdigest-sha-perl
-
+            zstd xz-utils tar gzip python3 pkg-config binutils kmod libdigest-sha-perl \
+            debhelper devscripts dh-autoreconf lintian
       - name: Prepare versions
         id: prep
         run: |
           TAG='${{ inputs.tag }}'
-          # strip huruf v/V di depan agar sesuai aturan versi Debian
           KV="${TAG#v}"
           KV="${KV#V}"
           if ! [[ "$KV" =~ ^[0-9] ]]; then
