@@ -1,0 +1,12 @@
+# Jangan pernah commit source kernel dan paket biner
+*.deb
+*.changes
+*.buildinfo
+out/
+linux-*
+*.tar
+*.tar.*
+*.xz
+*.zst
+*.gz
+*.zip
