@@ -1,0 +1,110 @@
+name: Build VoluntasOS Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "linux-stable tag (mis. v6.6.54)"
+        required: true
+        default: "v6.6.54"
+      pkgver:
+        description: "Suffix versi paket .deb (mis. voluntasos1)"
+        required: true
+        default: "voluntasos1"
+      make_release:
+        description: "Buat GitHub Release dan lampirkan .deb?"
+        required: true
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker system prune -af || true
+          df -h
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc flex bison libssl-dev libelf-dev \
+            dwarves pahole libncurses-dev fakeroot rsync ccache git dpkg-dev \
+            zstd xz-utils tar gzip python3 pkg-config binutils kmod libdigest-sha-perl
+
+      - name: Clone linux-stable
+        run: |
+          git clone --depth 1 --branch "${{ inputs.tag }}" \
+            https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git linux-voluntasos
+
+      - name: Seed .config
+        working-directory: linux-voluntasos
+        run: |
+          if [ -f "${{ github.workspace }}/configs/voluntasos.config" ]; then
+            cp "${{ github.workspace }}/configs/voluntasos.config" .config
+          else
+            echo "configs/voluntasos.config tidak ditemukan; memakai defconfig"
+            make defconfig
+          fi
+          yes "" | make olddefconfig
+
+      - name: Apply VoluntasOS config
+        working-directory: linux-voluntasos
+        run: |
+          ./scripts/config --disable PREEMPT_NONE
+          ./scripts/config --enable  PREEMPT_VOLUNTARY
+          ./scripts/config --disable PREEMPT
+          ./scripts/config --disable PREEMPT_DYNAMIC
+          ./scripts/config --disable HZ_1000
+          ./scripts/config --enable  HZ_250
+          ./scripts/config --enable  HZ
+          ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          ./scripts/config --set-str SYSTEM_REVOCATION_KEYS "" || true
+          ./scripts/config --disable DEBUG_INFO
+          ./scripts/config --disable DEBUG_INFO_BTF || true
+          ./scripts/config --disable RUST || true
+          ./scripts/config --set-str LOCALVERSION "-voluntasos"
+          yes "" | make olddefconfig
+
+      - name: Build .deb to out/
+        working-directory: linux-voluntasos
+        env:
+          KBUILD_PKGDEST: ${{ github.workspace }}/out
+        run: |
+          mkdir -p "$KBUILD_PKGDEST"
+          make -j"$(nproc)" bindeb-pkg KDEB_PKGVERSION="${{ inputs.tag }}-${{ inputs.pkgver }}"
+
+      - name: List outputs
+        run: ls -lh out || true
+
+      - name: Upload artifacts (.deb)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debs-${{ inputs.tag }}-${{ inputs.pkgver }}
+          path: |
+            out/*.deb
+            *.buildinfo
+            *.changes
+          retention-days: 60
+
+      - name: Create GitHub Release (opsional)
+        if: ${{ inputs.make_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}-${{ inputs.pkgver }}
+          name: "VoluntasOS Kernel ${{ inputs.tag }}-${{ inputs.pkgver }}"
+          body: |
+            Kernel VoluntasOS dengan PREEMPT_VOLUNTARY.
+            Sumber linux-stable tag: ${{ inputs.tag }}
+          files: |
+            out/*.deb
