@@ -1,126 +1,160 @@
-# (place this at .github/workflows/build-kernel.yml in your repo)
+# Full GitHub Actions workflow to build a VoluntasOS kernel .deb and publish it
+# - Builds linux-stable (tag input) with VoluntasOS config (PREEMPT_VOLUNTARY)
+# - Produces .deb files into $GITHUB_WORKSPACE/out
+# - Uploads artifacts for quick download
+# - Creates (or updates) a GitHub Release and attaches the .deb files as permanent release assets
+# Usage:
+# - Put this file at .github/workflows/build-kernel.yml in your repo
+# - Add your exported .config to configs/voluntasos.config (optional). If missing, workflow uses defconfig.
+# - Run from Actions → "Build VoluntasOS Kernel" → set tag (e.g. v6.6.54) and pkgver (e.g. voluntasos1).
+#
+# Notes:
+# - The workflow sanitizes the tag (strips a leading "v") when forming the Debian package version.
+# - The workflow runs the full build in a single job, so the release step has direct access to the built files.
+# - Ensure the repository visibility or collaborator permissions are set according to who must access the Release
+#   (public repo → public access; private repo → only repo members with read access).
+#
 name: Build VoluntasOS Kernel
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "linux-stable tag (mis. v6.6.54)"
+        description: "linux-stable tag (e.g., v6.6.54)"
         required: true
         default: "v6.6.54"
       pkgver:
-        description: "Suffix versi paket .deb (mis. voluntasos1)"
+        description: "Suffix for package version (e.g., voluntasos1)"
         required: true
         default: "voluntasos1"
       make_release:
-        description: "Buat GitHub Release dan lampirkan .deb?"
+        description: "Create a GitHub Release and attach .deb assets?"
         required: true
-        default: "false"
+        default: "true"
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Free disk space
+      - name: Free disk space (best-effort)
         run: |
-          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/share/boost \
-            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf /opt/hostedtoolcache/* || true
           sudo docker system prune -af || true
           df -h
 
-      - name: Install deps (including debhelper)
+      - name: Install build & packaging dependencies
         run: |
           sudo apt-get update
-          # Core build deps + debhelper/devscripts needed for dpkg-buildpackage
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential bc flex bison libssl-dev libelf-dev \
             dwarves pahole libncurses-dev fakeroot rsync ccache git dpkg-dev \
-            zstd xz-utils tar gzip python3 pkg-config binutils kmod libdigest-sha-perl \
-            debhelper devscripts dh-autoreconf lintian
-      - name: Prepare versions
+            zstd xz-utils tar gzip python3 pkg-config binutils kmod \
+            libdigest-sha-perl debhelper devscripts dh-autoreconf lintian
+
+      - name: Prepare sanitized version variables
         id: prep
         run: |
           TAG='${{ inputs.tag }}'
+          # strip leading 'v' or 'V' for Debian-version compliance
           KV="${TAG#v}"
           KV="${KV#V}"
+          # fallback check
           if ! [[ "$KV" =~ ^[0-9] ]]; then
-            echo "Sanitized version does not start with a digit: '$KV'"; exit 1
+            echo "Sanitized version ($KV) does not start with a digit. Please use a tag like 'v6.6.54' or '6.6.54'." >&2
+            exit 1
           fi
           echo "KV=$KV" >> "$GITHUB_ENV"
           echo "KV=$KV"
+          echo "PKGVER=${{ inputs.pkgver }}" >> "$GITHUB_ENV"
+          echo "MAKE_RELEASE=${{ inputs.make_release }}" >> "$GITHUB_ENV"
 
-      - name: Clone linux-stable
+      - name: Clone linux-stable source
         run: |
           git clone --depth 1 --branch "${{ inputs.tag }}" \
             https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git linux-voluntasos
+        # If tag is e.g. "6.6.54" and upstream branch is "v6.6.54", user should pass v-prefixed tag.
+        # We keep clone using the 'tag' input verbatim.
 
-      - name: Seed .config
+      - name: Seed .config (use repo config if present)
         working-directory: linux-voluntasos
         run: |
           if [ -f "${{ github.workspace }}/configs/voluntasos.config" ]; then
+            echo "Using configs/voluntasos.config from repo"
             cp "${{ github.workspace }}/configs/voluntasos.config" .config
           else
-            echo "configs/voluntasos.config tidak ditemukan; memakai defconfig"
+            echo "No custom config found; using defconfig"
             make defconfig
           fi
           yes "" | make olddefconfig
 
-      - name: Apply VoluntasOS config
+      - name: Apply VoluntasOS config adjustments
         working-directory: linux-voluntasos
         run: |
-          ./scripts/config --disable PREEMPT_NONE
-          ./scripts/config --enable  PREEMPT_VOLUNTARY
-          ./scripts/config --disable PREEMPT
-          ./scripts/config --disable PREEMPT_DYNAMIC
-          ./scripts/config --disable HZ_1000
-          ./scripts/config --enable  HZ_250
-          ./scripts/config --enable  HZ
-          ./scripts/config --set-str SYSTEM_TRUSTED_KEYS ""
+          # Ensure PREEMPT_VOLUNTARY + sane HZ; remove Ubuntu trusted certs to avoid canonical-certs dependency
+          ./scripts/config --disable PREEMPT_NONE || true
+          ./scripts/config --enable PREEMPT_VOLUNTARY || true
+          ./scripts/config --disable PREEMPT || true
+          ./scripts/config --disable PREEMPT_DYNAMIC || true
+          ./scripts/config --disable HZ_1000 || true
+          ./scripts/config --enable HZ_250 || true
+          ./scripts/config --enable HZ || true
+          ./scripts/config --set-str SYSTEM_TRUSTED_KEYS "" || true
           ./scripts/config --set-str SYSTEM_REVOCATION_KEYS "" || true
-          ./scripts/config --disable DEBUG_INFO
+          # Reduce disk footprint in CI
+          ./scripts/config --disable DEBUG_INFO || true
           ./scripts/config --disable DEBUG_INFO_BTF || true
           ./scripts/config --disable RUST || true
-          ./scripts/config --set-str LOCALVERSION "-voluntasos"
+          ./scripts/config --set-str LOCALVERSION "-voluntasos" || true
           yes "" | make olddefconfig
 
-      - name: Build .deb to out/
+      - name: Build .deb packages (bindeb-pkg) into out/
         working-directory: linux-voluntasos
         env:
           KBUILD_PKGDEST: ${{ github.workspace }}/out
           KV: ${{ env.KV }}
+          PKGVER: ${{ env.PKGVER }}
         run: |
           mkdir -p "$KBUILD_PKGDEST"
-          make -j"$(nproc)" bindeb-pkg KDEB_PKGVERSION="${KV}-${{ inputs.pkgver }}"
+          echo "Building kernel packages into $KBUILD_PKGDEST"
+          # Note: KDEB_PKGVERSION must start with digit, so we use sanitized KV
+          make -j"$(nproc)" bindeb-pkg KDEB_PKGVERSION="${KV}-${PKGVER}"
 
-      - name: List outputs
-        run: ls -lh out || true
+      - name: Show produced files
+        run: |
+          echo "Listing workspace and out/"
+          pwd
+          ls -la "$GITHUB_WORKSPACE" || true
+          ls -la "$GITHUB_WORKSPACE/out" || true
+          find "$GITHUB_WORKSPACE/out" -maxdepth 1 -type f -printf "%p %s bytes\n" || true
 
       - name: Upload artifacts (.deb)
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-debs-${{ env.KV }}-${{ inputs.pkgver }}
+          name: kernel-debs-${{ env.KV }}-${{ env.PKGVER }}
           path: |
             out/*.deb
-            *.buildinfo
-            *.changes
-          retention-days: 60
+            out/*.changes
+            out/*.buildinfo
+          retention-days: 90
 
-      - name: Create GitHub Release (opsional)
-        if: ${{ inputs.make_release == 'true' }}
+      - name: Create GitHub Release and attach .deb assets (optional)
+        if: ${{ env.MAKE_RELEASE == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}-${{ inputs.pkgver }}
-          name: "VoluntasOS Kernel ${{ inputs.tag }}-${{ inputs.pkgver }}"
+          tag_name: ${{ env.KV }}-${{ env.PKGVER }}
+          name: "VoluntasOS Kernel ${{ env.KV }}-${{ env.PKGVER }}"
           body: |
-            Kernel VoluntasOS dengan PREEMPT_VOLUNTARY.
-            Sumber linux-stable tag: ${{ inputs.tag }}
-          files: |
-            out/*.deb
+            Kernel VoluntasOS with PREEMPT_VOLUNTARY.
+            Built from linux-stable tag: ${{ inputs.tag }}
+          files: out/*.deb
           overwrite: true
