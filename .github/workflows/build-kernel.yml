@@ -1,19 +1,4 @@
-# Full GitHub Actions workflow to build a VoluntasOS kernel .deb and publish it
-# - Builds linux-stable (tag input) with VoluntasOS config (PREEMPT_VOLUNTARY)
-# - Produces .deb files into $GITHUB_WORKSPACE/out
-# - Uploads artifacts for quick download
-# - Creates (or updates) a GitHub Release and attaches the .deb files as permanent release assets
-# Usage:
-# - Put this file at .github/workflows/build-kernel.yml in your repo
-# - Add your exported .config to configs/voluntasos.config (optional). If missing, workflow uses defconfig.
-# - Run from Actions → "Build VoluntasOS Kernel" → set tag (e.g. v6.6.54) and pkgver (e.g. voluntasos1).
-#
-# Notes:
-# - The workflow sanitizes the tag (strips a leading "v") when forming the Debian package version.
-# - The workflow runs the full build in a single job, so the release step has direct access to the built files.
-# - Ensure the repository visibility or collaborator permissions are set according to who must access the Release
-#   (public repo → public access; private repo → only repo members with read access).
-#
+# Full GitHub Actions workflow: build kernel .deb, upload artifact, (optional) create Release with assets
 name: Build VoluntasOS Kernel
 
 on:
@@ -65,25 +50,23 @@ jobs:
         id: prep
         run: |
           TAG='${{ inputs.tag }}'
-          # strip leading 'v' or 'V' for Debian-version compliance
           KV="${TAG#v}"
           KV="${KV#V}"
-          # fallback check
           if ! [[ "$KV" =~ ^[0-9] ]]; then
             echo "Sanitized version ($KV) does not start with a digit. Please use a tag like 'v6.6.54' or '6.6.54'." >&2
             exit 1
           fi
           echo "KV=$KV" >> "$GITHUB_ENV"
-          echo "KV=$KV"
           echo "PKGVER=${{ inputs.pkgver }}" >> "$GITHUB_ENV"
           echo "MAKE_RELEASE=${{ inputs.make_release }}" >> "$GITHUB_ENV"
+          echo "KV=$KV"
+          echo "PKGVER=${{ inputs.pkgver }}"
+          echo "MAKE_RELEASE=${{ inputs.make_release }}"
 
       - name: Clone linux-stable source
         run: |
           git clone --depth 1 --branch "${{ inputs.tag }}" \
             https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git linux-voluntasos
-        # If tag is e.g. "6.6.54" and upstream branch is "v6.6.54", user should pass v-prefixed tag.
-        # We keep clone using the 'tag' input verbatim.
 
       - name: Seed .config (use repo config if present)
         working-directory: linux-voluntasos
@@ -100,7 +83,6 @@ jobs:
       - name: Apply VoluntasOS config adjustments
         working-directory: linux-voluntasos
         run: |
-          # Ensure PREEMPT_VOLUNTARY + sane HZ; remove Ubuntu trusted certs to avoid canonical-certs dependency
           ./scripts/config --disable PREEMPT_NONE || true
           ./scripts/config --enable PREEMPT_VOLUNTARY || true
           ./scripts/config --disable PREEMPT || true
@@ -110,32 +92,43 @@ jobs:
           ./scripts/config --enable HZ || true
           ./scripts/config --set-str SYSTEM_TRUSTED_KEYS "" || true
           ./scripts/config --set-str SYSTEM_REVOCATION_KEYS "" || true
-          # Reduce disk footprint in CI
           ./scripts/config --disable DEBUG_INFO || true
           ./scripts/config --disable DEBUG_INFO_BTF || true
           ./scripts/config --disable RUST || true
           ./scripts/config --set-str LOCALVERSION "-voluntasos" || true
           yes "" | make olddefconfig
 
-      - name: Build .deb packages (bindeb-pkg) into out/
+      - name: Build .deb packages (bindeb-pkg)
         working-directory: linux-voluntasos
         env:
-          KBUILD_PKGDEST: ${{ github.workspace }}/out
           KV: ${{ env.KV }}
           PKGVER: ${{ env.PKGVER }}
         run: |
-          mkdir -p "$KBUILD_PKGDEST"
-          echo "Building kernel packages into $KBUILD_PKGDEST"
-          # Note: KDEB_PKGVERSION must start with digit, so we use sanitized KV
+          echo "Building kernel packages (bindeb-pkg)."
+          # bindeb-pkg typically places output in parent directory of source tree.
+          # We'll build and then move any produced packages from parent into $GITHUB_WORKSPACE/out
           make -j"$(nproc)" bindeb-pkg KDEB_PKGVERSION="${KV}-${PKGVER}"
+
+      - name: Move produced packages into out/
+        working-directory: linux-voluntasos
+        run: |
+          # Ensure out directory exists in repository workspace (not inside source)
+          mkdir -p "${{ github.workspace }}/out"
+          # bindeb-pkg writes to parent dir: move linux-*.deb, *.changes, *.buildinfo if present
+          echo "Moving any produced artifacts from parent dir to ${GITHUB_WORKSPACE}/out"
+          mv -v ../linux-*.deb ../*.changes ../*.buildinfo "${{ github.workspace }}/out/" 2>/dev/null || true
+          # Also move any linux-*.deb directly in workspace root (in case)
+          mv -v "${{ github.workspace }}"/*.deb "${{ github.workspace }}/out/" 2>/dev/null || true
+          mv -v "${{ github.workspace }}"/*.changes "${{ github.workspace }}/out/" 2>/dev/null || true
+          mv -v "${{ github.workspace }}"/*.buildinfo "${{ github.workspace }}/out/" 2>/dev/null || true
 
       - name: Show produced files
         run: |
-          echo "Listing workspace and out/"
-          pwd
-          ls -la "$GITHUB_WORKSPACE" || true
-          ls -la "$GITHUB_WORKSPACE/out" || true
-          find "$GITHUB_WORKSPACE/out" -maxdepth 1 -type f -printf "%p %s bytes\n" || true
+          echo "Workspace root:"
+          ls -la "${{ github.workspace }}" || true
+          echo "out/ contents:"
+          ls -la "${{ github.workspace }}/out" || true
+          find "${{ github.workspace }}/out" -maxdepth 1 -type f -printf "%p %s bytes\n" || true
 
       - name: Upload artifacts (.deb)
         uses: actions/upload-artifact@v4
@@ -157,4 +150,4 @@ jobs:
             Kernel VoluntasOS with PREEMPT_VOLUNTARY.
             Built from linux-stable tag: ${{ inputs.tag }}
           files: out/*.deb
-          overwrite: true
+          overwrite_files: true
