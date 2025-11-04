@@ -86,16 +86,19 @@ jobs:
 
       - name: List outputs
         run: ls -lh out || true
-
-      - name: Upload artifacts (.deb)
-        uses: actions/upload-artifact@v4
+        
+      - name: Create GitHub Release (opsional)
+        if: ${{ inputs.make_release == 'true' }}
+        uses: softprops/action-gh-release@v2
         with:
-          name: kernel-debs-${{ inputs.tag }}-${{ inputs.pkgver }}
-          path: |
+          tag_name: ${{ inputs.tag }}-${{ inputs.pkgver }}
+          name: "VoluntasOS Kernel ${{ inputs.tag }}-${{ inputs.pkgver }}"
+          body: |
+            Kernel VoluntasOS dengan PREEMPT_VOLUNTARY.
+            Sumber linux-stable tag: ${{ inputs.tag }}
+          files: |
             out/*.deb
-            *.buildinfo
-            *.changes
-          retention-days: 60
+          overwrite: true
 
       - name: Create GitHub Release (opsional)
         if: ${{ inputs.make_release == 'true' }}
